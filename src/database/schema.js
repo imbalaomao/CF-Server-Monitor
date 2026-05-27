@@ -93,10 +93,11 @@ export async function initDatabase(db) {
       )
     `).run();
 
-    // 为历史数据表创建索引，加速查询
+    // 为历史数据表创建覆盖索引，加速查询并减少扫描行数
     await db.prepare(`
-      CREATE INDEX IF NOT EXISTS idx_history_server_time 
-      ON metrics_history(server_id, timestamp)
+      CREATE INDEX IF NOT EXISTS idx_history_server_time_covering 
+      ON metrics_history(server_id, timestamp) 
+      INCLUDE (cpu, ram, disk, processes, net_in_speed, net_out_speed, tcp_conn, udp_conn, ping_ct, ping_cu, ping_cm, ping_bd)
     `).run();
 
     // 数据库列迁移（兼容旧版本）
@@ -146,8 +147,8 @@ export async function cleanupOldData(db) {
       ).run();
       totalDeleted += strDeleteResult.meta.changes || 0;
       
-      // 清理7天前的数字格式时间戳数据
-      const cutoff = now - 7 * oneDay;
+      // 清理3天前的数字格式时间戳数据
+      const cutoff = now - 3 * oneDay;
       const intDeleteResult = await db.prepare(
         `DELETE FROM metrics_history WHERE typeof(timestamp) = 'integer' AND timestamp < ?`
       ).bind(cutoff).run();

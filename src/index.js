@@ -6,6 +6,10 @@ import { handleDashboard, handleServerDetail, handleServerAPI, handleServersAPI 
 import { loadSettings } from './utils/settings.js';
 import { checkAuth, authResponse } from './middleware/auth.js';
 
+const historyCache = new Map();
+const CACHE_TTL = 60000;
+const MAX_HOURS = 72;
+
 function downsampleData(data, hours) {
   if (data.length <= 1) return data;
   
@@ -50,8 +54,18 @@ async function fetchHistoryData(env, sys, request, id, hours, columns) {
   const server = await env.DB.prepare(serverQuery).bind(id).first();
   if (!server) return new Response('Not Found', { status: 404 });
   
+  const clampedHours = Math.min(hours, MAX_HOURS);
+  
+  const cacheKey = `${id}_${clampedHours}_${columns}`;
+  const cached = historyCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+    return new Response(JSON.stringify(cached.data), {
+      headers: { 'Content-Type': 'application/json', 'X-Cache': 'HIT' }
+    });
+  }
+  
   const now = Date.now();
-  const cutoff = now - (hours * 60 * 60 * 1000);
+  const cutoff = now - (clampedHours * 60 * 60 * 1000);
   
   const history = await env.DB.prepare(`
     SELECT timestamp, ${columns}
@@ -63,7 +77,7 @@ async function fetchHistoryData(env, sys, request, id, hours, columns) {
       (typeof(timestamp) = 'text' AND timestamp > datetime('now', '-' || ? || ' hours'))
     )
     ORDER BY timestamp ASC
-  `).bind(id, cutoff, hours).all();
+  `).bind(id, cutoff, clampedHours).all();
   
   const processed = history.results.map(row => {
     let ts = row.timestamp;
@@ -76,10 +90,15 @@ async function fetchHistoryData(env, sys, request, id, hours, columns) {
     };
   });
   
-  const sampled = downsampleData(processed, hours);
+  const sampled = downsampleData(processed, clampedHours);
+  
+  historyCache.set(cacheKey, {
+    timestamp: Date.now(),
+    data: sampled
+  });
   
   return new Response(JSON.stringify(sampled), {
-    headers: { 'Content-Type': 'application/json' }
+    headers: { 'Content-Type': 'application/json', 'X-Cache': 'MISS' }
   });
 }
 
