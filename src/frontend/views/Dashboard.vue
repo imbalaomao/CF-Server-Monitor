@@ -178,9 +178,9 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import TerminalHeader from '../components/TerminalHeader.vue'
 import ServerCard from '../components/ServerCard.vue'
 import Footer from '../components/Footer.vue'
-import { fetchServers, formatBytes } from '../utils/api'
-import { t, currentLang } from '../utils/i18n'
-import { translations } from '../utils/i18n'
+import { fetchServers, formatBytes, createLiveSocket } from '../utils/api.js'
+import { t, currentLang } from '../utils/i18n.js'
+import { translations } from '../utils/i18n.js'
 
 const servers = ref([])
 const stats = ref({ total: '-', online: 0, offline: 0, globalNetRx: 0, globalNetTx: 0, globalSpeedIn: 0, globalSpeedOut: 0 })
@@ -196,6 +196,7 @@ const countryStats = ref({})
 const currentView = ref('card')
 const currentFilter = ref('all')
 const mapInitialized = ref(false)
+const liveConnected = ref(false)
 
 const trans = computed(() => translations[currentLang.value] || translations.en)
 
@@ -249,25 +250,76 @@ const getStatusColor = (server) => {
 
 const getUpdateTime = (lastUpdated) => {
   if (!lastUpdated) return '-'
-  const diffMs = Date.now() - new Date(lastUpdated).getTime()
-  if (diffMs < 0) return '00:00:00 ago'
-  const totalSeconds = Math.floor(diffMs / 1000)
-  const days = Math.floor(totalSeconds / 86400)
-  const hours = Math.floor((totalSeconds % 86400) / 3600) + days * 24
-  const minutes = Math.floor((totalSeconds % 3600) / 60)
-  const seconds = totalSeconds % 60
-  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')} ago`
+  const date = new Date(lastUpdated)
+  return date.toLocaleString(undefined, { hour12: false })
+}
+
+// 用最新数据增量更新单台服务器信息
+// 无论后端 last_updated 是否变化，都用前端收到推送的时间更新 last_updated，
+// 保证实时时间列（"xx:xx:xx ago"）在每次推送时都刷新。
+const mergeServerUpdate = (data) => {
+  if (!data || !data.id) return false
+  const idx = servers.value.findIndex(s => s.id === data.id)
+  if (idx >= 0) {
+    // 已有服务器：合并字段，同时更新 last_updated 为前端收到时间
+    servers.value[idx] = { ...servers.value[idx], ...data, last_updated: Date.now() }
+  } else {
+    // 新服务器：加入列表
+    servers.value.push({ ...data, name: data.id, last_updated: Date.now() })
+  }
+  return true
+}
+
+const recomputeStats = () => {
+  const list = servers.value || []
+  const now = Date.now()
+  let online = 0
+  let speedIn = 0, speedOut = 0, netRx = 0, netTx = 0
+  const countryCounts = {}
+  for (const s of list) {
+    const ts = new Date(s.last_updated || 0).getTime()
+    const isOnline = ts && (now - ts) < 300000
+    if (isOnline) {
+      online++
+      speedIn += parseFloat(s.net_in_speed) || 0
+      speedOut += parseFloat(s.net_out_speed) || 0
+    }
+    netRx += parseFloat(s.net_rx) || 0
+    netTx += parseFloat(s.net_tx) || 0
+    if (s.country) {
+      const key = String(s.country).toUpperCase()
+      countryCounts[key] = (countryCounts[key] || 0) + 1
+    }
+  }
+  stats.value = {
+    total: list.length,
+    online,
+    offline: list.length - online,
+    globalNetRx: netRx,
+    globalNetTx: netTx,
+    globalSpeedIn: speedIn,
+    globalSpeedOut: speedOut
+  }
+  countryStats.value = countryCounts
 }
 
 const refreshData = async () => {
   try {
     const data = await fetchServers()
     if (!data) return
-    
-    servers.value = data.servers || []
-    stats.value = data.stats || { total: '-', online: 0, offline: 0, globalNetRx: 0, globalNetTx: 0, globalSpeedIn: 0, globalSpeedOut: 0 }
-    countryStats.value = data.countryStats || {}
-    
+
+    // 合并已有列表与最新服务端全量数据（优先使用服务端返回的 name/group 等完整字段）
+    const existingById = new Map(servers.value.map(s => [s.id, s]))
+    const nextList = (data.servers || []).map(s => {
+      const prev = existingById.get(s.id)
+      // 取服务端返回作为权威数据，并保留本地字段以防服务端缺少
+      return { ...prev, ...s }
+    })
+    servers.value = nextList
+
+    if (data.stats) stats.value = data.stats
+    if (data.countryStats) countryStats.value = data.countryStats
+
     sysConfig.value = {
       show_price: data.sysConfig?.show_price ?? true,
       show_expire: data.sysConfig?.show_expire ?? true,
@@ -276,11 +328,43 @@ const refreshData = async () => {
       site_title: data.sysConfig?.site_title || 'Server Monitor',
       admin_title: data.sysConfig?.admin_title || 'Admin'
     }
-    
+
     drawMarkers()
   } catch (e) {
-    console.log('[INFO] Refresh pending...', e)
+    console.log('[INFO] Full refresh pending...', e)
   }
+}
+
+// -------------------------------------------------------------------------
+// 实时推送：
+//   - 订阅 "all"，收到任何服务器的更新都会合并对应 server 的指标
+//   - WS 连上后关闭 60s 兜底轮询；断开后临时开启作为降级（WS 重连成功后再次清除）
+// -------------------------------------------------------------------------
+let liveSocket = null
+let refreshInterval = null
+let themeObserver = null
+
+const applyLiveUpdate = ({ serverId, data }) => {
+  if (!data || !serverId) return
+  mergeServerUpdate(data)
+  recomputeStats()
+  if (currentView.value === 'map') drawMarkers()
+}
+
+const startLiveSocket = () => {
+  liveSocket = createLiveSocket('all', {
+    onUpdate: applyLiveUpdate,
+    onStatus: ({ connected }) => {
+      liveConnected.value = !!connected
+      if (connected) {
+        // WS 可用，清除定时轮询
+        if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null }
+      } else if (!refreshInterval) {
+        // WS 断开，降级启用 60s 轮询直到重连成功
+        refreshInterval = setInterval(refreshData, 60000)
+      }
+    }
+  })
 }
 
 const initMap = () => {
@@ -312,9 +396,9 @@ const createMap = () => {
     attributionControl: false,
     minZoom: 1
   }).setView([30, 10], 2)
-  
+
   window.L.control.zoom({ position: 'bottomright' }).addTo(window.myMap)
-  
+
   fetch('https://cdn.jsdelivr.net/gh/johan/world.geo.json@master/countries.geo.json')
     .then(res => res.json())
     .then(worldGeoJson => {
@@ -346,7 +430,6 @@ const iso2To3 = {
 
 let markersLayer, geoJsonLayer, currentMapDataStr = ""
 
-// 获取当前主题的颜色
 const getThemeColors = () => {
   const isLight = document.body.classList.contains('light')
   return {
@@ -361,21 +444,21 @@ const getThemeColors = () => {
 
 const drawMarkers = () => {
   if (!window.myMap || !window.worldGeoJson) return
-  
+
   const newDataStr = JSON.stringify(countryStats.value)
   if (currentMapDataStr === newDataStr) return
   currentMapDataStr = newDataStr
-  
+
   if (geoJsonLayer) window.myMap.removeLayer(geoJsonLayer)
   if (markersLayer) markersLayer.clearLayers()
   else markersLayer = window.L.layerGroup().addTo(window.myMap)
-  
+
   const colors = getThemeColors()
   const activeIso3 = {}
   for (const code in countryStats.value) {
     if (iso2To3[code.toUpperCase()]) activeIso3[iso2To3[code.toUpperCase()]] = true
   }
-  
+
   geoJsonLayer = window.L.geoJSON(window.worldGeoJson, {
     style: function(feature) {
       const isActive = activeIso3[feature.id]
@@ -388,7 +471,7 @@ const drawMarkers = () => {
       }
     }
   }).addTo(window.myMap)
-  
+
   for (const [code, count] of Object.entries(countryStats.value)) {
     const upperCode = code.toUpperCase()
     if (countryCoords[upperCode]) {
@@ -406,24 +489,20 @@ const goToServer = (id) => {
   window.location.href = `/server/${id}`
 }
 
-let refreshInterval = null
-let themeObserver = null
-
 onMounted(() => {
   const savedView = localStorage.getItem('monitor_preferred_view') || 'card'
   currentView.value = savedView
   refreshData()
-  refreshInterval = setInterval(refreshData, 60000)
-  
+  startLiveSocket()
+
   if (savedView === 'map') {
     switchView('map')
   }
-  
-  // 监听主题切换，重新绘制 map
+
   themeObserver = new MutationObserver((mutations) => {
     mutations.forEach((mutation) => {
       if (mutation.attributeName === 'class' && currentView.value === 'map') {
-        currentMapDataStr = '' // 清空缓存，强制重绘
+        currentMapDataStr = ''
         drawMarkers()
       }
     })
@@ -433,6 +512,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   if (refreshInterval) clearInterval(refreshInterval)
+  if (liveSocket) liveSocket.close()
   if (themeObserver) themeObserver.disconnect()
 })
 </script>

@@ -3,11 +3,19 @@ import { checkOfflineNodes } from './services/notification.js';
 import { updateDatabase, cleanupStaleSettings } from './database/updateDatabase.js';
 import { handleAdminAPI } from './handlers/admin.js';
 import { serveFrontend } from './handlers/frontend.js';
-import { handleUpdate } from './handlers/update.js';
+import { handleUpdate, handleWebSocketUpgrade } from './handlers/update.js';
 import { handleServerAPI, handleServersAPI } from './handlers/dashboard.js';
 import { loadSettings } from './utils/settings.js';
 import { checkAuth, simpleAuthResponse } from './middleware/auth.js';
 import { getServerDetail, getMetricsHistoryCache, setMetricsHistoryCache } from './utils/cache.js';
+
+// Durable Objects: 实时指标广播
+// 显式 import + extends，确保 wrangler 静态分析器能在入口文件直接识别此 DO 类
+import { MetricsBroadcaster as _MetricsBroadcaster }
+  from './durable/MetricsBroadcaster.js';
+
+export class MetricsBroadcaster extends _MetricsBroadcaster {}
+
 
 async function getEncryptionKey(env) {
   const secret = env.TURNSTILE_SECRET_KEY || env.API_SECRET || 'default_secret_key_for_turnstile_encryption';
@@ -272,6 +280,25 @@ export default {
       }},
       { method: 'GET', path: '/api/servers', handler: async () => {
         return handleServersAPI(request, env, sys);
+      }},
+      // WebSocket 实时推送入口（Durable Object）
+      { method: 'GET', path: '/api/ws', handler: async () => handleWebSocketUpgrade(request, env) },
+      // Durable Object 健康检查（同时作为 bundler 引用点，确保 MetricsBroadcaster 被打包）
+      { method: 'GET', path: '/__do/health', handler: async () => {
+        if (!env.METRICS_BROADCASTER) {
+          return new Response(JSON.stringify({ ok: false, reason: 'DO not bound' }), {
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+        try {
+          const id = env.METRICS_BROADCASTER.idFromName('global');
+          const stub = env.METRICS_BROADCASTER.get(id);
+          return await stub.fetch('http://internal/health');
+        } catch (e) {
+          return new Response(JSON.stringify({ ok: false, reason: e.message }), {
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
       }},
       { method: 'GET', path: '/api/config', handler: handleGetConfig },
       { method: 'GET', path: '/api/history', handler: async () => {

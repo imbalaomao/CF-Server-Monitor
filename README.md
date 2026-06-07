@@ -1,6 +1,6 @@
 # CF-Server-Monitor
 
-**版本：V2.4.1**
+**版本：V2.5.0**
 
 **演示地址**：[https://tz.dashdeep.dpdns.org/](https://tz.dashdeep.dpdns.org/)
 
@@ -8,7 +8,7 @@
 
 ## ✨ 功能特点
 
-- 📊 **实时监控**：CPU、内存、磁盘、网络、进程数、连接数、负载均衡
+- 📊 **实时监控**：CPU、内存、磁盘、网络、进程数、连接数、负载均衡，探针上报后通过 WebSocket **立即推送**到前端，无延迟
 - 📈 **历史图表**：支持 1/3/6/12/24 小时历史数据查看
 - 🌍 **全球地图**：可视化展示服务器分布
 - 🔔 **离线告警**：支持 Telegram 和企业微信通知
@@ -21,6 +21,7 @@
 - 🧪 **本地测试**：支持本地模拟数据生成，方便开发和测试
 - 🔐 **Turnstile 验证**：集成 Cloudflare Turnstile 人机验证，增强 API 安全性
 - 🔑 **JWT 认证**：登录系统采用 JWT token 认证，支持自定义密钥
+- ⚡ **实时推送**：基于 Durable Objects + WebSocket，探针上报后页面立即刷新，无轮询延迟
 
 ## 🚀 快速开始
 
@@ -349,17 +350,19 @@ CF-Server-Monitor/
 │   ├── install.sh              # 一键安装脚本（含卸载）
 │   └── logo.svg                # Logo
 ├── src/
-│   ├── index.js                # 后端主入口 - 路由分发
+│   ├── index.js                # 后端主入口 - 路由分发 + Durable Object 导出
 │   ├── database/
 │   │   ├── schema.js           # 数据库初始化、历史数据存储
 │   │   └── updateDatabase.js   # 数据库升级处理
+│   ├── durable/
+│   │   └── MetricsBroadcaster.js  # Durable Object：WebSocket 实时推送广播中心
 │   ├── middleware/
 │   │   └── auth.js             # 认证中间件
 │   ├── handlers/
 │   │   ├── admin.js            # 后台管理 API
 │   │   ├── dashboard.js        # 前台大盘 API
 │   │   ├── frontend.js         # 前端资源服务
-│   │   └── update.js           # 数据上报处理
+│   │   └── update.js           # 数据上报处理 + 广播到 DO
 │   ├── services/
 │   │   └── notification.js     # 通知服务
 │   ├── utils/
@@ -372,12 +375,12 @@ CF-Server-Monitor/
 │       │   └── TerminalHeader.vue
 │       ├── views/              # 页面视图
 │       │   ├── Admin.vue
-│       │   ├── Dashboard.vue
-│       │   └── ServerDetail.vue
+│       │   ├── Dashboard.vue    # 首页（接入 WebSocket 实时推送）
+│       │   └── ServerDetail.vue # 详情页（接入 WebSocket 实时推送）
 │       ├── router/
 │       │   └── index.js        # Vue Router 配置
 │       ├── utils/
-│       │   ├── api.js          # API 请求封装
+│       │   ├── api.js          # API 请求封装 + WebSocket 客户端
 │       │   └── i18n.js         # 国际化配置
 │       ├── styles/             # 样式文件
 │       │   ├── light.css
@@ -389,6 +392,7 @@ CF-Server-Monitor/
 ├── test/
 │   ├── README.md               # 测试工具说明
 │   └── generate-sql.js         # 测试数据生成工具
+│   ├── mock-sender.sh          # 模拟数据发送脚本（macOS）
 ├── index.html
 ├── jsconfig.json               # JS 配置
 ├── package.json

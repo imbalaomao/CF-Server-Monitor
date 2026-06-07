@@ -221,7 +221,7 @@
         <span>{{ trans.lastUpdate }}: <span>{{ lastUpdateText }}</span></span>
       </div>
       <div class="status-bar-item">
-        <span>{{ trans.autoRefresh }}: 60{{ trans.seconds }}</span>
+        <span>{{ trans.autoRefresh }}: {{ trans.realtime || '实时' }}</span>
       </div>
     </div>
 
@@ -250,7 +250,7 @@ import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import TerminalHeader from '../components/TerminalHeader.vue'
 import Footer from '../components/Footer.vue'
-import { fetchServerDetail, fetchAllHistory, formatBytes, fetchConfig, isAdminLoggedIn } from '../utils/api'
+import { fetchServerDetail, fetchAllHistory, formatBytes, fetchConfig, isAdminLoggedIn, createLiveSocket } from '../utils/api.js'
 import Chart from 'chart.js/auto'
 import 'chartjs-adapter-date-fns'
 import { t, currentLang } from '../utils/i18n'
@@ -810,12 +810,18 @@ const appendDataToChart = (chart, datasetIndex, timestamp, value, isPing = false
   chart.update('none')
 }
 
-const fetchCurrentStatus = async () => {
+// 合并最新指标到 server 状态，并追加到所有图表
+// 既可以从接口拉取 (data=null)，也可以由 WebSocket 推送直接调用
+const fetchCurrentStatus = async (incomingData) => {
   try {
-    const data = await fetchServerDetail(serverId)
-    if (!data) return
+    let data = incomingData
+    if (!data) {
+      data = await fetchServerDetail(serverId)
+      if (!data) return
+    }
+    if (!data || !data.last_updated) return
 
-    server.value = data
+    server.value = { ...server.value, ...data }
 
     const dataTimestamp = new Date(data.last_updated).getTime()
     appendDataToChart(charts.cpu, 0, dataTimestamp, data.cpu)
@@ -832,32 +838,31 @@ const fetchCurrentStatus = async () => {
     appendDataToChart(charts.ping, 1, dataTimestamp, data.ping_cu, true)
     appendDataToChart(charts.ping, 2, dataTimestamp, data.ping_cm, true)
     appendDataToChart(charts.ping, 3, dataTimestamp, data.ping_bd, true)
-    // 追加负载数据
     if (charts.load) {
       const loads = parseLoadAvg(data.load_avg)
       const time = new Date(dataTimestamp).getTime()
       const endTime = Date.now()
       const startTime = endTime - currentHours.value * 60 * 60 * 1000
-      
+
       charts.load.data.datasets[0].data.push({ x: time, y: loads[0] })
       charts.load.data.datasets[1].data.push({ x: time, y: loads[1] })
       charts.load.data.datasets[2].data.push({ x: time, y: loads[2] })
-      
+
       charts.load.data.datasets[0].data = charts.load.data.datasets[0].data.filter(d => d.x >= startTime)
       charts.load.data.datasets[1].data = charts.load.data.datasets[1].data.filter(d => d.x >= startTime)
       charts.load.data.datasets[2].data = charts.load.data.datasets[2].data.filter(d => d.x >= startTime)
-      
+
       if (charts.load.options && charts.load.options.scales && charts.load.options.scales.x) {
         charts.load.options.scales.x.min = startTime
         charts.load.options.scales.x.max = endTime
       }
-      
+
       charts.load.update('none')
     }
 
     lastUpdateText.value = new Date().toLocaleTimeString()
   } catch (e) {
-    console.error('[ERROR] 获取状态失败:', e)
+    console.error('[ERROR] 更新状态失败:', e)
   }
 }
 
@@ -876,21 +881,35 @@ const goToLogin = () => {
 }
 
 let statusTimer = null
+let liveSocket = null
 
 const init = async () => {
-
-  // 确保所有 canvas 元素都已挂载
   await nextTick()
   await new Promise(resolve => setTimeout(resolve, 50))
 
-  // 检查所有 canvas ref 是否存在
-    if (cpuChartRef.value && ramChartRef.value && diskChartRef.value &&
-        netChartRef.value && procChartRef.value && connChartRef.value && pingChartRef.value && loadChartRef.value) {
-      initCharts()
-    }
+  if (cpuChartRef.value && ramChartRef.value && diskChartRef.value &&
+      netChartRef.value && procChartRef.value && connChartRef.value && pingChartRef.value && loadChartRef.value) {
+    initCharts()
+  }
   fetchCurrentStatus()
   loadAllHistory(currentHours.value)
-  statusTimer = setInterval(fetchCurrentStatus, 60000)
+
+  // 实时推送：探针上报时立即更新详情页图表
+  liveSocket = createLiveSocket(String(serverId), {
+    onUpdate: ({ serverId: sid, data }) => {
+      if (String(sid) !== String(serverId)) return
+      fetchCurrentStatus(data)
+    },
+    onStatus: ({ connected }) => {
+      if (connected) {
+        // WS 可用，清除降级轮询
+        if (statusTimer) { clearInterval(statusTimer); statusTimer = null }
+      } else if (!statusTimer) {
+        // WS 断开，降级启用 60s 轮询直到重连成功
+        statusTimer = setInterval(() => fetchCurrentStatus(), 60000)
+      }
+    }
+  })
 }
 
 onMounted(() => {
@@ -899,6 +918,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   if (statusTimer) clearInterval(statusTimer)
+  if (liveSocket) liveSocket.close()
   Object.values(charts).forEach(chart => chart.destroy())
 })
 </script>

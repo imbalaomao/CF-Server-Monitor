@@ -1,4 +1,100 @@
 const API_BASE = window.location.origin
+const WS_PROTO = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+const WS_BASE = `${WS_PROTO}//${window.location.host}`
+
+// -------------------------------------------------------------------------
+// WebSocket 实时推送客户端
+//   createLiveSocket(subscribe, { onUpdate, onStatus, onMessage })
+//   subscribe = 'all'            -> 订阅所有服务器（首页）
+//   subscribe = <serverId>       -> 只订阅某台服务器（详情页）
+//
+//   onUpdate({ serverId, data }): 收到最新一次指标时调用
+//   onStatus({ connected, reason }): 连接状态变化时调用
+//
+//   返回值：{ close(), reconnect() }
+// -------------------------------------------------------------------------
+export const createLiveSocket = (subscribe, handlers = {}) => {
+  const { onUpdate, onStatus, onMessage } = handlers
+  const scope = (subscribe || 'all').toLowerCase()
+  let ws = null
+  let manualClose = false
+  let reconnectTimer = null
+  let reconnectDelay = 1000
+  const MAX_DELAY = 30000
+
+  const setStatus = (connected, reason) => {
+    if (typeof onStatus === 'function') {
+      onStatus({ connected, reason: reason || '' })
+    }
+  }
+
+  const connect = () => {
+    manualClose = false
+    try {
+      ws = new WebSocket(`${WS_BASE}/api/ws?subscribe=${encodeURIComponent(scope)}`)
+    } catch (e) {
+      setStatus(false, '不支持 WebSocket')
+      return
+    }
+
+    ws.addEventListener('open', () => {
+      reconnectDelay = 1000
+      setStatus(true, 'connected')
+    })
+
+    ws.addEventListener('message', (event) => {
+      let msg = null
+      try {
+        msg = typeof event.data === 'string' ? JSON.parse(event.data) : null
+      } catch (_) { return }
+      if (!msg) return
+
+      if (msg.type === 'update' && typeof onUpdate === 'function') {
+        onUpdate({ serverId: msg.serverId, data: msg.data })
+      }
+      if (typeof onMessage === 'function') onMessage(msg)
+    })
+
+    ws.addEventListener('close', () => {
+      setStatus(false, 'disconnected')
+      scheduleReconnect()
+    })
+
+    ws.addEventListener('error', () => {
+      setStatus(false, 'error')
+      // 浏览器会在 error 后紧接着触发 close，reconnect 交由 close 处理
+      try { ws.close() } catch (_) {}
+    })
+  }
+
+  const scheduleReconnect = () => {
+    if (manualClose) return
+    if (reconnectTimer) return
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null
+      // 指数退避
+      const delay = reconnectDelay
+      reconnectDelay = Math.min(reconnectDelay * 2, MAX_DELAY)
+      setTimeout(connect, delay)
+    }, 50)
+  }
+
+  connect()
+
+  return {
+    close() {
+      manualClose = true
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
+      if (ws) { try { ws.close() } catch (_) {} ws = null }
+    },
+    reconnect() {
+      manualClose = false
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
+      if (ws) { try { ws.close() } catch (_) {} ws = null }
+      connect()
+    }
+  }
+}
 
 export const getAuthHeader = () => {
   const token = localStorage.getItem('jwt_token')
